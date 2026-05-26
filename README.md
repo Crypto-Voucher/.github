@@ -6,10 +6,21 @@ other repo in the org.
 
 ## What lives here
 
-### `pull_request_template.md`
+### PR templates
 
-The default PR body for every new PR opened in any Crypto-Voucher repo. A
-repo can override it locally by adding its own `.github/pull_request_template.md`
+| File                                  | When                                         |
+|---------------------------------------|----------------------------------------------|
+| `pull_request_template.md`            | **Default** — auto-applied to every new PR. Use for Jira-linked work. |
+| `PULL_REQUEST_TEMPLATE/chore.md`      | Hotfixes, dependency bumps, docs, refactor — anything without a Jira task. Pick via URL param. |
+
+To open a PR with the `chore` template, append `?template=chore.md` to the
+new-PR URL, e.g.:
+
+```
+https://github.com/Crypto-Voucher/<repo>/compare/master...feature-branch?template=chore.md
+```
+
+A repo can override either by adding its own `.github/pull_request_template.md`
 or `.github/PULL_REQUEST_TEMPLATE/*.md`.
 
 ### `workflows/*.yml`
