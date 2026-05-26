@@ -1,0 +1,39 @@
+name: SAST (Semgrep)
+
+# Reusable SAST scan using Semgrep with the org's default ruleset bundle
+# (p/default, p/javascript, p/security-audit, p/owasp-top-ten). Only
+# ERROR-severity findings fail the job — adjust `severity` input if you
+# want stricter or looser gating per service.
+
+on:
+  workflow_call:
+    inputs:
+      configs:
+        description: Space-separated --config flags for semgrep.
+        required: false
+        type: string
+        default: '--config=p/default --config=p/javascript --config=p/security-audit --config=p/owasp-top-ten'
+      severity:
+        required: false
+        type: string
+        default: 'ERROR'
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Semgrep scan
+        run: |
+          semgrep scan \
+            ${{ inputs.configs }} \
+            --severity=${{ inputs.severity }} \
+            --error \
+            --metrics=off

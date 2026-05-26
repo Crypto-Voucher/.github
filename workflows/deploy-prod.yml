@@ -1,0 +1,79 @@
+name: Deploy Production
+
+# Reusable production deployment. Same shape as deploy-stage.yml but targets
+# the production namespace and uses `environment: production` — when the org
+# upgrades to a paid GitHub plan, drop env reviewers into the production
+# environment in Terraform and this workflow will auto-gate on approval.
+#
+# Until then, the approval gate is the master-protection ruleset (PR + 1
+# admin approval before merge to master).
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      image_repository:
+        required: true
+        type: string
+      helm_chart:
+        required: true
+        type: string
+      namespace:
+        required: true
+        type: string
+      kubeconfig_secret_name:
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tag
+        id: tag
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build + push image
+        run: |
+          docker build -t ${{ inputs.image_repository }}:${{ steps.tag.outputs.tag }} .
+          docker push ${{ inputs.image_repository }}:${{ steps.tag.outputs.tag }}
+
+      - name: Check out infra_charts
+        uses: actions/checkout@v4
+        with:
+          repository: Crypto-Voucher/infra_charts
+          token: ${{ secrets.TF_GITHUB_TOKEN }}
+          path: infra_charts
+
+      - uses: azure/setup-helm@v4
+
+      - name: Configure kubeconfig
+        run: echo "${{ secrets[inputs.kubeconfig_secret_name] }}" | base64 -d > kubeconfig
+
+      - name: helm upgrade
+        env:
+          KUBECONFIG: kubeconfig
+        run: |
+          helm upgrade --install ${{ inputs.service_name }} \
+            infra_charts/${{ inputs.helm_chart }} \
+            --namespace ${{ inputs.namespace }} \
+            --create-namespace \
+            --set image.repository=${{ inputs.image_repository }} \
+            --set image.tag=${{ steps.tag.outputs.tag }} \
+            --wait --timeout 10m

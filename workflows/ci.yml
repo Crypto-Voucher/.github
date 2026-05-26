@@ -1,0 +1,64 @@
+name: CI
+
+# Reusable CI for service repos. The `build` job-id is the contract —
+# required-status-check contexts in the Terraform rulesets reference
+# "CI / build". Do not rename the job-id without coordinating an update to
+# rulesets[*].required_status_checks.contexts in the Terraform repo.
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: node / go / python
+        required: true
+        type: string
+      language_version:
+        description: Major version of the language toolchain.
+        required: true
+        type: string
+      test_command:
+        description: Override the language-default test command.
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: inputs.language == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.language_version }}
+          cache: npm
+
+      - name: Setup Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.language_version }}
+
+      - name: Setup Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.language_version }}
+
+      - name: Install (node)
+        if: inputs.language == 'node'
+        run: npm ci
+
+      - name: Lint + test (node)
+        if: inputs.language == 'node'
+        run: ${{ inputs.test_command || 'npm run lint && npm test' }}
+
+      - name: Test (go)
+        if: inputs.language == 'go'
+        run: ${{ inputs.test_command || 'go vet ./... && go test ./...' }}
+
+      - name: Test (python)
+        if: inputs.language == 'python'
+        run: ${{ inputs.test_command || 'pip install -r requirements.txt && pytest' }}

@@ -1,0 +1,151 @@
+name: Security & Build Check
+
+# Reusable security scanning + Docker build verification:
+#   1. security-audit  — Trivy FS scan of the repo for vulnerable deps
+#   2. config-scan     — Trivy config scan (Dockerfile/k8s/IaC misconfigs)
+#   3. docker-build-check — Build the Docker image, scan it with Trivy,
+#                            generate a CycloneDX SBOM, upload to
+#                            Dependency-Track (on push events only — PR
+#                            scans don't pollute DT).
+#
+# Required org secrets (set in `secrets/main.tf` and pushed to GH org):
+#   DEPENDENCY_TRACK_URL, DEPENDENCY_TRACK_API_KEY
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: Used to name the Dependency-Track project (`<service>-{stage,prod}`).
+        required: true
+        type: string
+      dockerfile_path:
+        required: false
+        type: string
+        default: '.'
+      severity:
+        description: Trivy severity threshold that fails the job.
+        required: false
+        type: string
+        default: 'CRITICAL,HIGH'
+
+permissions:
+  contents: read
+
+jobs:
+  security-audit:
+    name: Security Audit (Trivy FS)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trivy FS Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'table'
+          ignore-unfixed: true
+          exit-code: '1'
+          severity: ${{ inputs.severity }}
+
+  config-scan:
+    name: Security Audit (Trivy Config)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trivy Config Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: ${{ inputs.severity }}
+
+  docker-build-check:
+    name: Docker Build, Scan & SBOM
+    needs: [security-audit, config-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.dockerfile_path }}
+          load: true
+          tags: local-test:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy Image Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: 'local-test:${{ github.sha }}'
+          format: 'table'
+          ignore-unfixed: true
+          exit-code: '1'
+          severity: ${{ inputs.severity }}
+
+      - name: Generate CycloneDX SBOM
+        if: github.event_name == 'push'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: 'local-test:${{ github.sha }}'
+          format: 'cyclonedx'
+          output: 'sbom.cyclonedx.json'
+
+      - name: Upload SBOM to Dependency-Track
+        if: github.event_name == 'push'
+        env:
+          DT_URL: ${{ secrets.DEPENDENCY_TRACK_URL }}
+          DT_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+          PROJECT_NAME: ${{ inputs.service_name }}-${{ github.ref == 'refs/heads/master' && 'prod' || 'stage' }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DT_URL}" ] || [ -z "${DT_API_KEY}" ]; then
+            echo "::error::DEPENDENCY_TRACK_URL or DEPENDENCY_TRACK_API_KEY secret is not set"
+            exit 1
+          fi
+
+          DT_BASE="${DT_URL%/}"
+          echo "Target: ${DT_BASE} | project=${PROJECT_NAME} version=${GITHUB_SHA}"
+
+          echo "::group::Preflight: GET /api/version"
+          HTTP=$(curl --silent --show-error --output /tmp/dt-version.txt --write-out '%{http_code}' \
+            -H "X-Api-Key: ${DT_API_KEY}" \
+            "${DT_BASE}/api/version")
+          echo "HTTP ${HTTP}"
+          cat /tmp/dt-version.txt; echo
+          if [ "${HTTP}" != "200" ]; then
+            echo "::error::Cannot reach Dependency-Track API at ${DT_BASE}/api/version (HTTP ${HTTP}). Check that DEPENDENCY_TRACK_URL points to the API server, not the frontend."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::POST /api/v1/bom"
+          HTTP=$(curl --silent --show-error --output /tmp/dt-bom.txt --write-out '%{http_code}' \
+            -X POST "${DT_BASE}/api/v1/bom" \
+            -H "X-Api-Key: ${DT_API_KEY}" \
+            -F "autoCreate=true" \
+            -F "projectName=${PROJECT_NAME}" \
+            -F "projectVersion=${GITHUB_SHA}" \
+            -F "bom=@sbom.cyclonedx.json")
+          echo "HTTP ${HTTP}"
+          cat /tmp/dt-bom.txt; echo
+          if [ "${HTTP}" != "200" ]; then
+            if [ "${HTTP}" = "404" ]; then
+              echo "::error::404 on BOM upload. Most likely the API key lacks PROJECT_CREATION_UPLOAD permission, so autoCreate=true is silently ignored. Grant BOM_UPLOAD + PROJECT_CREATION_UPLOAD + VIEW_PORTFOLIO to the API key's team in DT Administration → Access Management."
+            fi
+            exit 1
+          fi
+          echo "::endgroup::"

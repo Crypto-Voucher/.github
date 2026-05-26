@@ -1,0 +1,85 @@
+name: Deploy Stage
+
+# Reusable stage deployment. Builds the service's Docker image, pushes to
+# ECR, runs `helm upgrade` against the stage namespace. Charts are pulled
+# from the Crypto-Voucher/infra_charts repo at the head of master.
+#
+# Required secrets (inherited via `secrets: inherit`):
+#   - TF_GITHUB_TOKEN          : checkout infra_charts (private)
+#   - <kubeconfig_secret_name> : base64-encoded kubeconfig for stage cluster
+#
+# Required variables:
+#   - AWS_DEPLOY_ROLE_ARN      : OIDC role for ECR push (org-level)
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      image_repository:
+        description: Fully-qualified ECR image repository.
+        required: true
+        type: string
+      helm_chart:
+        description: Path inside the infra_charts repo, e.g. charts/cv_api.
+        required: true
+        type: string
+      namespace:
+        required: true
+        type: string
+      kubeconfig_secret_name:
+        description: Name of the secret holding the base64-encoded kubeconfig.
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: stage
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tag
+        id: tag
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build + push image
+        run: |
+          docker build -t ${{ inputs.image_repository }}:${{ steps.tag.outputs.tag }} .
+          docker push ${{ inputs.image_repository }}:${{ steps.tag.outputs.tag }}
+
+      - name: Check out infra_charts
+        uses: actions/checkout@v4
+        with:
+          repository: Crypto-Voucher/infra_charts
+          token: ${{ secrets.TF_GITHUB_TOKEN }}
+          path: infra_charts
+
+      - uses: azure/setup-helm@v4
+
+      - name: Configure kubeconfig
+        run: echo "${{ secrets[inputs.kubeconfig_secret_name] }}" | base64 -d > kubeconfig
+
+      - name: helm upgrade
+        env:
+          KUBECONFIG: kubeconfig
+        run: |
+          helm upgrade --install ${{ inputs.service_name }} \
+            infra_charts/${{ inputs.helm_chart }} \
+            --namespace ${{ inputs.namespace }} \
+            --create-namespace \
+            --set image.repository=${{ inputs.image_repository }} \
+            --set image.tag=${{ steps.tag.outputs.tag }} \
+            --wait --timeout 5m

@@ -1,0 +1,65 @@
+name: PR Compliance
+
+# Reusable PR compliance checks. Called from each service's
+# .github/workflows/pr-compliance.yml:
+#
+#   jobs:
+#     compliance:
+#       uses: Crypto-Voucher/.github/.github/workflows/pr-compliance.yml@v1
+#
+# Validates branch naming (CV-XXXX) and that the PR description follows
+# the org-wide PR template (## Changes / ## Actions required after merge).
+
+on:
+  workflow_call:
+    inputs:
+      branch_regex:
+        description: Regex that feature branch names must match.
+        required: false
+        type: string
+        default: '^CV-[0-9]{4,5}$'
+      ignored_branches:
+        description: Comma-separated branch names exempt from naming check.
+        required: false
+        type: string
+        default: 'master,release,stage'
+
+jobs:
+  check-branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Branch Naming Convention
+        uses: deepakputhraya/action-branch-name@v1.0.0
+        with:
+          regex: ${{ inputs.branch_regex }}
+          allowed_prefixes: ''
+          ignore: ${{ inputs.ignored_branches }}
+          min_length: 7
+          max_length: 8
+
+  check-pr-template:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR Description for Template Compliance
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body;
+
+            if (!body) {
+              core.setFailed("PR description is empty!");
+              return;
+            }
+
+            const requiredStrings = [
+              "## Changes:",
+              "## Actions required after merge:",
+            ];
+
+            const missing = requiredStrings.filter(str => !body.includes(str));
+
+            if (missing.length > 0) {
+              core.setFailed(`PR description is missing required sections: ${missing.join(", ")}. Please use the PR template.`);
+            } else {
+              console.log("PR description looks good!");
+            }
