@@ -49,6 +49,18 @@ on:
         required: false
         type: string
         default: eu-central-1
+      build_arg_vars:
+        description: |
+          Space/newline-separated names of Actions Variables to forward as
+          `docker build --build-arg NAME=<value>`. Values are read from THIS
+          job's environment scope (inputs.environment), so per-environment
+          stage/prod values resolve correctly — the caller job cannot, since a
+          reusable-workflow caller may not declare `environment:`.
+          Use for build-time vars baked into the image (e.g. Vue CLI VUE_APP_*
+          inlined into the JS bundle at `npm run build`).
+        required: false
+        type: string
+        default: ""
 
 permissions:
   id-token: write
@@ -99,11 +111,30 @@ jobs:
             type=sha,prefix=sha-
             type=ref,event=tag
 
+      # Resolve the requested Actions Variables from this job's environment
+      # scope into KEY=VALUE lines for docker build-args. Runs here (not in the
+      # caller) because environment-scoped vars are only available in a job that
+      # declares `environment:`.
+      - name: Compose build args
+        id: build_args
+        env:
+          ALL_VARS: ${{ toJSON(vars) }}
+          FORWARD: ${{ inputs.build_arg_vars }}
+        run: |
+          {
+            echo 'value<<__BUILD_ARGS_EOF__'
+            for name in $FORWARD; do
+              printf '%s=%s\n' "$name" "$(jq -r --arg k "$name" '.[$k] // ""' <<<"$ALL_VARS")"
+            done
+            echo '__BUILD_ARGS_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
+          build-args: ${{ steps.build_args.outputs.value }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
