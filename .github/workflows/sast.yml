@@ -31,7 +31,7 @@ jobs:
         with:
           args: >
             -Dsonar.projectKey=${{ env.PROJECT_KEY }}
-            "-Dsonar.projectName=${{ inputs.PROJECT_NAME }}"
+            "-Dsonar.projectName=${{ env.PROJECT_NAME }}"
             -Dsonar.sources=.
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
