@@ -4,13 +4,6 @@ name: SAST (Sonarqube)
 
 on:
   workflow_call:
-    inputs:
-      service_key:
-        required: true
-        type: string
-      service_name:
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -18,16 +11,26 @@ permissions:
 jobs:
   sonar:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup variables
+        run: |
+          PROJECT_KEY="${GITHUB_REPOSITORY##*/}"
+          
+          PROJECT_NAME=$(echo "$PROJECT_KEY" \
+            | tr '_-' ' ' \
+            | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2)}1')
+          
+          echo "PROJECT_KEY=$PROJECT_KEY" >> $GITHUB_ENV
+          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
 
       - name: Sonar Scan
         uses: SonarSource/sonarqube-scan-action@master
         with:
           args: >
-            -Dsonar.projectKey=${{ inputs.service_key }}
-            "-Dsonar.projectName=${{ inputs.service_name }}"
+            -Dsonar.projectKey=${{ env.PROJECT_KEY }}
+            "-Dsonar.projectName=${{ env.PROJECT_NAME }}"
             -Dsonar.sources=.
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
