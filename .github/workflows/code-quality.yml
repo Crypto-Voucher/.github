@@ -38,6 +38,15 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+        env:
+          # Service repos that consume private @crypto-voucher packages from
+          # GitHub Packages ship an .npmrc with
+          #   //npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+          # npm expands that from the environment, so the token has to be here
+          # or `npm ci` 401s. GH_PACKAGES_TOKEN (org secret, read:packages) is
+          # preferred because the job token only reaches packages published
+          # from the same repo; it falls back to the job token when unset.
+          GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Lint
         run: ${{ inputs.lint_command }}

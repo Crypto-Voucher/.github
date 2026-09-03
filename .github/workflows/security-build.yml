@@ -30,6 +30,9 @@ on:
 
 permissions:
   contents: read
+  # Needed so the Docker build can pull private @crypto-voucher packages from
+  # GitHub Packages (see the `secrets:` on the build step below).
+  packages: read
 
 jobs:
   security-audit:
@@ -81,6 +84,13 @@ jobs:
           context: ${{ inputs.dockerfile_path }}
           load: true
           tags: local-test:${{ github.sha }}
+          # BuildKit secret for repos whose Dockerfile installs private
+          # @crypto-voucher packages. Consumed with
+          #   RUN --mount=type=secret,id=github_token ...
+          # so the token never lands in an image layer or `docker history`.
+          # Harmless for Dockerfiles that don't mount it.
+          secrets: |
+            github_token=${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

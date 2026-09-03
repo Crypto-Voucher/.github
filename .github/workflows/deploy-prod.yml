@@ -30,6 +30,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  packages: read
 
 jobs:
   deploy:
@@ -50,8 +51,17 @@ jobs:
         run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Build + push image
+        env:
+          DOCKER_BUILDKIT: '1'
+          # BuildKit secret for repos whose Dockerfile installs private
+          # @crypto-voucher packages from GitHub Packages. Consumed with
+          #   RUN --mount=type=secret,id=github_token ...
+          # so the token never lands in an image layer or `docker history`.
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          docker build -t ${{ inputs.image_repository }}:${{ steps.tag.outputs.tag }} .
+          docker build \
+            --secret id=github_token,env=GH_PACKAGES_TOKEN \
+            -t ${{ inputs.image_repository }}:${{ steps.tag.outputs.tag }} .
           docker push ${{ inputs.image_repository }}:${{ steps.tag.outputs.tag }}
 
       - name: Check out infra_charts
