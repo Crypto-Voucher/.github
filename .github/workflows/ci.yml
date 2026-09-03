@@ -50,6 +50,10 @@ jobs:
       - name: Install (node)
         if: inputs.language == 'node'
         run: npm ci
+        env:
+          # See code-quality.yml — private @crypto-voucher packages resolve
+          # from npm.pkg.github.com and need a token in ${GITHUB_TOKEN}.
+          GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Lint + test (node)
         if: inputs.language == 'node'

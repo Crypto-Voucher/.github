@@ -125,6 +125,14 @@ jobs:
           context: .
           push: true
           build-args: ${{ steps.build_args.outputs.value }}
+          # BuildKit secret for repos whose Dockerfile installs private
+          # @crypto-voucher packages from GitHub Packages. Consumed with
+          #   RUN --mount=type=secret,id=github_token ...
+          # so the token never lands in an image layer or `docker history`.
+          # Unlike build-args this is not baked into the image; harmless for
+          # Dockerfiles that don't mount it.
+          secrets: |
+            github_token=${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
