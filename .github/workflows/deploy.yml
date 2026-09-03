@@ -1,8 +1,9 @@
-name: Build, Push & Deploy
+name: Build and Push
 
-# Reusable deploy workflow. Builds the service's Docker image, pushes to
-# ECR + GHCR, runs `helm upgrade` against the EKS cluster matching the
-# `environment` input, then notifies Telegram.
+# Reusable build workflow for services deployed by GitOps. Builds the
+# service's Docker image, pushes it to ECR and GHCR, and notifies Telegram.
+# Image promotion and Kubernetes deployment are handled separately through
+# the GitOps repository and Argo CD.
 #
 # Triggers live in the per-service wrapper (push to stage branch, push of
 # v* tag, etc.) — this workflow only takes `environment` as input and
@@ -22,27 +23,11 @@ on:
         required: true
         type: string
       service_name:
-        description: Helm release name and Telegram message header.
+        description: Service name used in the image summary and Telegram message.
         required: true
         type: string
       ecr_repository:
         description: ECR image repo name (without the registry URL).
-        required: true
-        type: string
-      helm_chart_version:
-        description: Version of the shared `microservice` chart pulled from ECR OCI registry.
-        required: true
-        type: string
-      eks_cluster:
-        description: EKS cluster name, e.g. cv-cluster-stage.
-        required: true
-        type: string
-      k8s_namespace:
-        description: Target namespace, e.g. risk-api-stage.
-        required: true
-        type: string
-      values_file:
-        description: Path inside the service repo to the env-specific values.yaml.
         required: true
         type: string
       aws_region:
@@ -68,7 +53,7 @@ permissions:
   packages: write
 
 jobs:
-  deploy:
+  build-and-push:
     runs-on:
       - self-hosted
       - linux
@@ -78,6 +63,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: image
+        shell: bash
+        run: echo "tag=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -140,40 +130,14 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-        with:
-          version: v3.14.0
-
-      - name: Update Kubeconfig
-        run: aws eks update-kubeconfig --name ${{ inputs.eks_cluster }} --region ${{ inputs.aws_region }}
-
-      - name: Create namespace if not exists
+      - name: Publish image summary
+        shell: bash
         run: |
-          kubectl create namespace ${{ inputs.k8s_namespace }} --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Deploy with Helm
-        run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          IMAGE_TAG="sha-$SHORT_SHA"
-
-          echo "📦 Deploying image tag: $IMAGE_TAG"
-          echo "📋 Using values file: ${{ inputs.values_file }}"
-          echo "🎯 Target namespace: ${{ inputs.k8s_namespace }}"
-
-          aws ecr get-login-password --region ${{ inputs.aws_region }} | \
-          helm registry login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
-
-          helm upgrade --install ${{ inputs.service_name }} \
-            oci://${{ steps.login-ecr.outputs.registry }}/charts/microservice \
-            --version ${{ inputs.helm_chart_version }} \
-            --namespace ${{ inputs.k8s_namespace }} \
-            --values ${{ inputs.values_file }} \
-            --set image.tag=$IMAGE_TAG \
-            --wait \
-            --timeout 5m
-
-          echo "✅ Deployment complete!"
+          echo "## Published image" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Service: ${{ inputs.service_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Environment: ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: \`${{ steps.image.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ECR: \`${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.image.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify Telegram
         if: always()
@@ -181,9 +145,9 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          STATUS="✅ Deployment successful!"
+          STATUS="✅ Image build successful!"
           if [[ "${{ job.status }}" != "success" ]]; then
-            STATUS="❌ Deployment failed!"
+            STATUS="❌ Image build failed!"
           fi
 
           ENV_LABEL="🌍 ${{ inputs.environment }}"
@@ -198,5 +162,5 @@ jobs:
           Repo: ${{ github.repository }}
           Service: ${{ inputs.service_name }}
           Environment: ${{ inputs.environment }}
-          Image: sha-$(git rev-parse --short HEAD)
+          Image: ${{ steps.image.outputs.tag }}
           Triggered by: ${{ github.actor }}"
