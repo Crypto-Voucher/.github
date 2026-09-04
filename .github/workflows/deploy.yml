@@ -17,6 +17,11 @@ name: Build and Push
 
 on:
   workflow_call:
+    secrets:
+      GITOPS_APP_ID:
+        required: false
+      GITOPS_APP_KEY:
+        required: false
     inputs:
       environment:
         description: stage | prod
@@ -209,7 +214,7 @@ jobs:
         id: token
         uses: actions/create-github-app-token@v2
         with:
-          app-id: ${{ vars.GITOPS_APP_ID }}
+          app-id: ${{ secrets.GITOPS_APP_ID }}
           private-key: ${{ secrets.GITOPS_APP_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: gitops
