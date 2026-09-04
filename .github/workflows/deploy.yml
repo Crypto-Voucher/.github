@@ -46,6 +46,22 @@ on:
         required: false
         type: string
         default: ""
+      gitops_app_dir:
+        description: |
+          Katalog serwisu w repo gitops (apps/<dir>/stage/values.yaml).
+          Domyślnie równy ecr_repository — pokrywa się dla cv-api,
+          wallet-api-v2, notification-api itd.
+        required: false
+        type: string
+        default: ""
+      gitops_enabled:
+        description: Ustaw false dla serwisów spoza gitopsa.
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image_tag:
+        value: ${{ jobs.build-and-push.outputs.image_tag }}
 
 permissions:
   id-token: write
@@ -54,6 +70,8 @@ permissions:
 
 jobs:
   build-and-push:
+    outputs:
+      image_tag: ${{ steps.image.outputs.tag }}
     runs-on:
       - self-hosted
       - linux
@@ -172,3 +190,81 @@ jobs:
           Environment: ${{ inputs.environment }}
           Image: ${{ steps.image.outputs.tag }}
           Triggered by: ${{ github.actor }}"
+
+  bump-gitops:
+    needs: build-and-push
+    if: inputs.environment == 'stage' && inputs.gitops_enabled
+    runs-on:
+      - self-hosted
+      - linux
+      - eks-access
+      - ${{ inputs.environment }}
+    permissions:
+      contents: read
+    concurrency:
+      group: gitops-write-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Mint GitHub App token for gitops repo
+        id: token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: gitops
+
+      - name: Checkout gitops
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/gitops
+          token: ${{ steps.token.outputs.token }}
+          path: gitops
+
+      - name: Bump image tag
+        working-directory: gitops
+        env:
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          APP_DIR: ${{ inputs.gitops_app_dir != '' && inputs.gitops_app_dir || inputs.ecr_repository }}
+        run: |
+          set -euo pipefail
+          FILE="apps/${APP_DIR}/stage/values.yaml"
+          
+          test -f "$FILE" || { echo "::error::$FILE nie istnieje w repo gitops"; exit 1; }
+          
+          # Dokładnie jedna linia `  tag:` na drugim poziomie wcięcia (image.tag).
+          MATCHES=$(grep -cE '^  tag: ' "$FILE" || true)
+          if [[ "$MATCHES" != "1" ]]; then
+            echo "::error::Oczekiwano 1 linii 'tag:' w $FILE, znaleziono $MATCHES"
+            exit 1
+          fi
+          
+          CURRENT=$(grep -E '^  tag: ' "$FILE" | sed -E 's/^  tag: "?([^"]*)"?/\1/')
+          if [[ "$CURRENT" == "$TAG" ]]; then
+            echo "Tag już ustawiony na $TAG, nic do zrobienia."
+            exit 0
+          fi
+          
+          sed -i -E "s|^(  tag: ).*|\\1\"${TAG}\"|" "$FILE"
+          git diff --stat
+          
+          git config user.name  "gitops-bot[bot]"
+          git config user.email "gitops-bot[bot]@users.noreply.github.com"
+          git add "$FILE"
+          git commit -m "chore(${APP_DIR}/stage): image ${TAG}" \
+                     -m "Source: ${{ github.repository }}@${{ github.sha }}"
+          
+          # Inne serwisy pushują do tego samego repo równolegle — concurrency
+          # jest per-repo, więc kolizje między repo są normalne.
+          for i in 1 2 3 4 5; do
+            if git push; then exit 0; fi
+            sleep $(( (RANDOM % 5) + 2 ))
+            git pull --rebase --autostash
+          done
+          echo "::error::Nie udało się wypchnąć po 5 próbach"
+          exit 1
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "- GitOps: \`apps/${{ inputs.gitops_app_dir != '' && inputs.gitops_app_dir || inputs.ecr_repository }}/stage/values.yaml\` → \`${{ needs.build-and-push.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
