@@ -233,24 +233,26 @@ jobs:
           APP_DIR: ${{ inputs.gitops_app_dir != '' && inputs.gitops_app_dir || inputs.ecr_repository }}
         run: |
           set -euo pipefail
-          FILE="apps/${APP_DIR}/stage/values.yaml"
+          FILE="apps/${APP_DIR}/stage/config.yaml"
           
           test -f "$FILE" || { echo "::error::$FILE nie istnieje w repo gitops"; exit 1; }
           
-          # Dokładnie jedna linia `  tag:` na drugim poziomie wcięcia (image.tag).
-          MATCHES=$(grep -cE '^  tag: ' "$FILE" || true)
+          # imageTag jest jedynym źródłem prawdy o wdrożonym obrazie: ApplicationSet
+          # podaje je jako parametr Helma i wystawia w adnotacji Application, dzięki
+          # czemu Argo widzi tag i może go pokazać w powiadomieniach.
+          MATCHES=$(grep -cE '^imageTag: ' "$FILE" || true)
           if [[ "$MATCHES" != "1" ]]; then
-            echo "::error::Oczekiwano 1 linii 'tag:' w $FILE, znaleziono $MATCHES"
+            echo "::error::Oczekiwano 1 linii 'imageTag:' w $FILE, znaleziono $MATCHES"
             exit 1
           fi
           
-          CURRENT=$(grep -E '^  tag: ' "$FILE" | sed -E 's/^  tag: "?([^"]*)"?/\1/')
+          CURRENT=$(grep -E '^imageTag: ' "$FILE" | sed -E 's/^imageTag: "?([^"]*)"?/\1/')
           if [[ "$CURRENT" == "$TAG" ]]; then
             echo "Tag już ustawiony na $TAG, nic do zrobienia."
             exit 0
           fi
           
-          sed -i -E "s|^(  tag: ).*|\\1\"${TAG}\"|" "$FILE"
+          sed -i -E "s|^(imageTag: ).*|\\1\"${TAG}\"|" "$FILE"
           git diff --stat
           
           git config user.name  "gitops-bot[bot]"
@@ -272,4 +274,4 @@ jobs:
       - name: Summary
         if: success()
         run: |
-          echo "- GitOps: \`apps/${{ inputs.gitops_app_dir != '' && inputs.gitops_app_dir || inputs.ecr_repository }}/stage/values.yaml\` → \`${{ needs.build-and-push.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- GitOps: \`apps/${{ inputs.gitops_app_dir != '' && inputs.gitops_app_dir || inputs.ecr_repository }}/stage/config.yaml\` → \`${{ needs.build-and-push.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
