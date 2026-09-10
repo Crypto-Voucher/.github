@@ -7,7 +7,7 @@ name: PR Compliance
 #     compliance:
 #       uses: Crypto-Voucher/.github/.github/workflows/pr-compliance.yml@v1
 #
-# Validates branch naming (CV-XXXX) and that the PR description follows
+# Validates branch naming (CV-XXXX or GMC-XXXX) and that the PR description follows
 # the org-wide PR template (## Changes / ## Actions required after merge).
 
 on:
@@ -17,7 +17,7 @@ on:
         description: Regex that feature branch names must match.
         required: false
         type: string
-        default: '^CV-[0-9]{4,5}$'
+        default: '^(CV|GMC)-[0-9]{4,5}$'
       ignored_branches:
         description: Comma-separated branch names exempt from naming check.
         required: false
