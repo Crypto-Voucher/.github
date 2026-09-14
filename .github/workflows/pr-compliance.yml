@@ -22,7 +22,7 @@ on:
         description: Comma-separated branch names exempt from naming check.
         required: false
         type: string
-        default: 'master,release,stage'
+        default: 'master,release,stage,release/*'
 
 jobs:
   check-branch-name:
