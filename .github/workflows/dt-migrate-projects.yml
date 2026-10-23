@@ -9,8 +9,10 @@ name: Dependency-Track Project Migration
 #      `<service>` @ `<env>` (+ tag `<env>`, `prod` flagged as latest), so its
 #      audit trail — analyses, suppressions, metrics history — carries over.
 #   2. The remaining SHA versions are deleted.
-# Groups whose target `<service>` @ `<env>` already exists are skipped, so
-# run this before the new security-build.yml uploads anything.
+# If the target `<service>` @ `<env>` already exists (the new layout has
+# uploaded since), every SHA version in the group is deleted instead — their
+# analyses are not carried over. This makes the workflow safe to re-run as a
+# final sweep once all services use the new layout.
 #
 # Defaults to a dry run that only prints the plan. Requires an API key with
 # PORTFOLIO_MANAGEMENT (DEPENDENCY_TRACK_ADMIN_API_KEY if set, otherwise
@@ -98,7 +100,7 @@ jobs:
             exit 0
           fi
 
-          renamed=0 deleted=0 skipped=0
+          renamed=0 deleted=0 swept=0
           while read -r group; do
             service=$(jq -r '.[0].service' <<<"${group}")
             env=$(jq -r '.[0].env' <<<"${group}")
@@ -109,24 +111,24 @@ jobs:
             exists=$(jq --arg n "${service}" --arg v "${env}" \
               'any(.[]; .name == $n and .version == $v)' /tmp/projects.json)
             if [ "${exists}" = "true" ]; then
-              echo "::warning::${service} @ ${env} already exists — skipping ${service}-${env}, clean it up by hand."
-              skipped=$((skipped + 1))
-              echo "::endgroup::"
-              continue
+              echo "${service} @ ${env} already exists — deleting all old versions"
+              stale='.[]'
+              swept=$((swept + 1))
+            else
+              is_latest=false
+              [ "${env}" = "prod" ] && is_latest=true
+              patch=$(jq -nc --arg n "${service}" --arg v "${env}" --argjson l "${is_latest}" \
+                '{name: $n, version: $v, tags: [{name: $v}], active: true, isLatest: $l}')
+
+              echo "keep:   $(jq -r '.version' <<<"${keep}") (${keep_uuid}) → ${patch}"
+              if [ "${DRY_RUN}" != "true" ]; then
+                dt PATCH "/api/v1/project/${keep_uuid}" "${patch}" > /dev/null
+              fi
+              renamed=$((renamed + 1))
+              stale='.[1:][]'
             fi
 
-            is_latest=false
-            [ "${env}" = "prod" ] && is_latest=true
-            patch=$(jq -nc --arg n "${service}" --arg v "${env}" --argjson l "${is_latest}" \
-              '{name: $n, version: $v, tags: [{name: $v}], active: true, isLatest: $l}')
-
-            echo "keep:   $(jq -r '.version' <<<"${keep}") (${keep_uuid}) → ${patch}"
-            if [ "${DRY_RUN}" != "true" ]; then
-              dt PATCH "/api/v1/project/${keep_uuid}" "${patch}" > /dev/null
-            fi
-            renamed=$((renamed + 1))
-
-            for uuid in $(jq -r '.[1:][].uuid' <<<"${group}"); do
+            for uuid in $(jq -r "${stale}.uuid" <<<"${group}"); do
               echo "delete: $(jq -r --arg u "${uuid}" '.[] | select(.uuid == $u) | .version' <<<"${group}") (${uuid})"
               if [ "${DRY_RUN}" != "true" ]; then
                 dt DELETE "/api/v1/project/${uuid}" > /dev/null
@@ -137,7 +139,7 @@ jobs:
           done < /tmp/groups.jsonl
 
           mode=$([ "${DRY_RUN}" = "true" ] && echo " (dry run — nothing changed)" || echo "")
-          summary="Renamed ${renamed}, deleted ${deleted}, skipped ${skipped}${mode}"
+          summary="Renamed ${renamed}, deleted ${deleted} (${swept} groups already migrated)${mode}"
           echo "${summary}"
           echo "### Dependency-Track migration" >> "$GITHUB_STEP_SUMMARY"
           echo "${summary}" >> "$GITHUB_STEP_SUMMARY"
