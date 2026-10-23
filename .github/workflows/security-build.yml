@@ -6,7 +6,10 @@ name: Security & Build Check
 #   3. docker-build-check — Build the Docker image, scan it with Trivy,
 #                            generate a CycloneDX SBOM, upload to
 #                            Dependency-Track (on push events only — PR
-#                            scans don't pollute DT).
+#                            scans don't pollute DT). Each service is one
+#                            DT project with fixed `stage`/`prod` versions,
+#                            so every upload replaces that version's BOM
+#                            and triage decisions survive between deploys.
 #
 # Required org secrets (set in `secrets/main.tf` and pushed to GH org):
 #   DEPENDENCY_TRACK_URL, DEPENDENCY_TRACK_API_KEY
@@ -15,7 +18,7 @@ on:
   workflow_call:
     inputs:
       service_name:
-        description: Used to name the Dependency-Track project (`<service>-{stage,prod}`).
+        description: Dependency-Track project name; versions are `stage` and `prod`.
         required: true
         type: string
       dockerfile_path:
@@ -118,7 +121,8 @@ jobs:
         env:
           DT_URL: ${{ secrets.DEPENDENCY_TRACK_URL }}
           DT_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
-          PROJECT_NAME: ${{ inputs.service_name }}-${{ github.ref == 'refs/heads/master' && 'prod' || 'stage' }}
+          DT_ENV: ${{ github.ref == 'refs/heads/master' && 'prod' || 'stage' }}
+          PROJECT_NAME: ${{ inputs.service_name }}
         run: |
           set -euo pipefail
 
@@ -128,7 +132,13 @@ jobs:
           fi
 
           DT_BASE="${DT_URL%/}"
-          echo "Target: ${DT_BASE} | project=${PROJECT_NAME} version=${GITHUB_SHA}"
+          # The `prod` version is flagged as the project's latest (DT >= 4.12),
+          # so the portfolio and badges point at what is running on prod.
+          # Tags and isLatest are only applied when autoCreate creates the
+          # version; later uploads just replace its BOM.
+          IS_LATEST=false
+          if [ "${DT_ENV}" = "prod" ]; then IS_LATEST=true; fi
+          echo "Target: ${DT_BASE} | project=${PROJECT_NAME} version=${DT_ENV} sha=${GITHUB_SHA} isLatest=${IS_LATEST}"
 
           echo "::group::Preflight: GET /api/version"
           HTTP=$(curl --silent --show-error --output /tmp/dt-version.txt --write-out '%{http_code}' \
@@ -148,7 +158,9 @@ jobs:
             -H "X-Api-Key: ${DT_API_KEY}" \
             -F "autoCreate=true" \
             -F "projectName=${PROJECT_NAME}" \
-            -F "projectVersion=${GITHUB_SHA}" \
+            -F "projectVersion=${DT_ENV}" \
+            -F "projectTags=${DT_ENV}" \
+            -F "isLatest=${IS_LATEST}" \
             -F "bom=@sbom.cyclonedx.json")
           echo "HTTP ${HTTP}"
           cat /tmp/dt-bom.txt; echo

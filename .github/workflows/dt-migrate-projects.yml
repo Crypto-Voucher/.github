@@ -1,0 +1,143 @@
+name: Dependency-Track Project Migration
+
+# One-off migration from the old Dependency-Track layout (one project per
+# deploy: `<service>-{stage,prod}` @ <git sha>) to the layout used by
+# security-build.yml (one project per service: `<service>` @ `stage|prod`).
+#
+# For every `<service>-<env>` project whose versions are git SHAs:
+#   1. The most recently uploaded version is renamed in place to
+#      `<service>` @ `<env>` (+ tag `<env>`, `prod` flagged as latest), so its
+#      audit trail — analyses, suppressions, metrics history — carries over.
+#   2. The remaining SHA versions are deleted.
+# Groups whose target `<service>` @ `<env>` already exists are skipped, so
+# run this before the new security-build.yml uploads anything.
+#
+# Defaults to a dry run that only prints the plan. Requires an API key with
+# PORTFOLIO_MANAGEMENT (DEPENDENCY_TRACK_ADMIN_API_KEY if set, otherwise
+# DEPENDENCY_TRACK_API_KEY).
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only print what would change.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    name: Migrate DT projects
+    runs-on: ubuntu-latest
+    steps:
+      - name: Migrate projects
+        env:
+          DT_URL: ${{ secrets.DEPENDENCY_TRACK_URL }}
+          DT_API_KEY: ${{ secrets.DEPENDENCY_TRACK_ADMIN_API_KEY || secrets.DEPENDENCY_TRACK_API_KEY }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DT_URL}" ] || [ -z "${DT_API_KEY}" ]; then
+            echo "::error::DEPENDENCY_TRACK_URL or DEPENDENCY_TRACK_API_KEY secret is not set"
+            exit 1
+          fi
+          DT_BASE="${DT_URL%/}"
+
+          # dt METHOD PATH [JSON] — prints the body, fails on non-2xx.
+          dt() {
+            local method="$1" path="$2" body="${3:-}" http
+            local args=(--silent --show-error --output /tmp/dt-resp.json --write-out '%{http_code}'
+                        -X "${method}" -H "X-Api-Key: ${DT_API_KEY}")
+            if [ -n "${body}" ]; then
+              args+=(-H 'Content-Type: application/json' --data "${body}")
+            fi
+            http=$(curl "${args[@]}" "${DT_BASE}${path}")
+            if [ "${http}" -lt 200 ] || [ "${http}" -ge 300 ]; then
+              echo "::error::${method} ${path} → HTTP ${http}: $(cat /tmp/dt-resp.json)" >&2
+              if [ "${http}" = "403" ]; then
+                echo "::error::The API key needs PORTFOLIO_MANAGEMENT (set DEPENDENCY_TRACK_ADMIN_API_KEY)." >&2
+              fi
+              return 1
+            fi
+            cat /tmp/dt-resp.json
+          }
+
+          echo "::group::Fetch portfolio"
+          echo '[]' > /tmp/projects.json
+          page=1
+          while :; do
+            dt GET "/api/v1/project?pageSize=500&pageNumber=${page}" > /tmp/page.json
+            count=$(jq 'length' /tmp/page.json)
+            jq -s 'add' /tmp/projects.json /tmp/page.json > /tmp/merged.json
+            mv /tmp/merged.json /tmp/projects.json
+            [ "${count}" -lt 500 ] && break
+            page=$((page + 1))
+          done
+          echo "Projects in portfolio: $(jq 'length' /tmp/projects.json)"
+          echo "::endgroup::"
+
+          # Old-layout projects grouped by (service, env), newest upload first.
+          jq -c '
+            [ .[]
+              | select(.version // "" | test("^[0-9a-f]{40}$"))
+              | (.name | capture("^(?<service>.+)-(?<env>prod|stage)$")) as $m
+              | select($m != null)
+              | { uuid, name, version, service: $m.service, env: $m.env,
+                  imported: (.lastBomImport // 0) } ]
+            | group_by(.service, .env)
+            | map(sort_by(-.imported))
+            | .[]
+          ' /tmp/projects.json > /tmp/groups.jsonl
+
+          if [ ! -s /tmp/groups.jsonl ]; then
+            echo "Nothing to migrate."
+            exit 0
+          fi
+
+          renamed=0 deleted=0 skipped=0
+          while read -r group; do
+            service=$(jq -r '.[0].service' <<<"${group}")
+            env=$(jq -r '.[0].env' <<<"${group}")
+            keep=$(jq -c '.[0]' <<<"${group}")
+            keep_uuid=$(jq -r '.uuid' <<<"${keep}")
+            echo "::group::${service}-${env} → ${service} @ ${env}"
+
+            exists=$(jq --arg n "${service}" --arg v "${env}" \
+              'any(.[]; .name == $n and .version == $v)' /tmp/projects.json)
+            if [ "${exists}" = "true" ]; then
+              echo "::warning::${service} @ ${env} already exists — skipping ${service}-${env}, clean it up by hand."
+              skipped=$((skipped + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            is_latest=false
+            [ "${env}" = "prod" ] && is_latest=true
+            patch=$(jq -nc --arg n "${service}" --arg v "${env}" --argjson l "${is_latest}" \
+              '{name: $n, version: $v, tags: [{name: $v}], active: true, isLatest: $l}')
+
+            echo "keep:   $(jq -r '.version' <<<"${keep}") (${keep_uuid}) → ${patch}"
+            if [ "${DRY_RUN}" != "true" ]; then
+              dt PATCH "/api/v1/project/${keep_uuid}" "${patch}" > /dev/null
+            fi
+            renamed=$((renamed + 1))
+
+            for uuid in $(jq -r '.[1:][].uuid' <<<"${group}"); do
+              echo "delete: $(jq -r --arg u "${uuid}" '.[] | select(.uuid == $u) | .version' <<<"${group}") (${uuid})"
+              if [ "${DRY_RUN}" != "true" ]; then
+                dt DELETE "/api/v1/project/${uuid}" > /dev/null
+              fi
+              deleted=$((deleted + 1))
+            done
+            echo "::endgroup::"
+          done < /tmp/groups.jsonl
+
+          mode=$([ "${DRY_RUN}" = "true" ] && echo " (dry run — nothing changed)" || echo "")
+          summary="Renamed ${renamed}, deleted ${deleted}, skipped ${skipped}${mode}"
+          echo "${summary}"
+          echo "### Dependency-Track migration" >> "$GITHUB_STEP_SUMMARY"
+          echo "${summary}" >> "$GITHUB_STEP_SUMMARY"
