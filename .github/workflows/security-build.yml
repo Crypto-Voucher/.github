@@ -3,13 +3,17 @@ name: Security & Build Check
 # Reusable security scanning + Docker build verification:
 #   1. security-audit  — Trivy FS scan of the repo for vulnerable deps
 #   2. config-scan     — Trivy config scan (Dockerfile/k8s/IaC misconfigs)
-#   3. docker-build-check — Build the Docker image, scan it with Trivy,
-#                            generate a CycloneDX SBOM, upload to
-#                            Dependency-Track (on push events only — PR
-#                            scans don't pollute DT). Each service is one
+#   3. docker-build-check — Build the Docker image, generate a CycloneDX
+#                            SBOM, upload it to Dependency-Track (on push
+#                            events only — PR scans don't pollute DT), then
+#                            scan the image with Trivy. Each service is one
 #                            DT project with fixed `stage`/`prod` versions,
 #                            so every upload replaces that version's BOM
 #                            and triage decisions survive between deploys.
+#
+# The SBOM upload does not depend on the Trivy gates: DT has to track the
+# deployed dependencies precisely when they are vulnerable. Failing scans
+# still fail the workflow.
 #
 # Required org secrets (set in `secrets/main.tf` and pushed to GH org):
 #   DEPENDENCY_TRACK_URL, DEPENDENCY_TRACK_API_KEY
@@ -72,7 +76,6 @@ jobs:
 
   docker-build-check:
     name: Docker Build, Scan & SBOM
-    needs: [security-audit, config-scan]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -82,6 +85,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.dockerfile_path }}
@@ -96,16 +100,6 @@ jobs:
             github_token=${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Trivy Image Scan
-        uses: aquasecurity/trivy-action@0.35.0
-        with:
-          scan-type: 'image'
-          image-ref: 'local-test:${{ github.sha }}'
-          format: 'table'
-          ignore-unfixed: true
-          exit-code: '1'
-          severity: ${{ inputs.severity }}
 
       - name: Generate CycloneDX SBOM
         if: github.event_name == 'push'
@@ -171,3 +165,15 @@ jobs:
             exit 1
           fi
           echo "::endgroup::"
+
+      - name: Trivy Image Scan
+        # Runs even if the DT upload failed, so its result is never hidden.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: 'image'
+          image-ref: 'local-test:${{ github.sha }}'
+          format: 'table'
+          ignore-unfixed: true
+          exit-code: '1'
+          severity: ${{ inputs.severity }}
