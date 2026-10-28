@@ -42,6 +42,25 @@ header comments inside the file. The corresponding service-repo wrapper
 templates live in
 [`Crypto-Voucher/github_iac`](https://github.com/Crypto-Voucher/github_iac/tree/master/templates/service-repo).
 
+### Runners
+
+Every reusable workflow except `deploy.yml` takes a `runs_on` input (JSON list
+of labels). Since `v2.6` it defaults to the self-hosted CI pool
+`["self-hosted", "linux", "x64", "ci"]`: ephemeral spot instances from
+[`gmc_iac/github-runners-v2`](https://github.com/Crypto-Voucher/gmc_iac/tree/master/github-runners-v2),
+one job per instance, no AWS permissions. `deploy.yml` keeps its
+`eks-access` + environment labels, which the `deploy-stage`/`deploy-prod`
+pools serve. To fall back to GitHub-hosted runners for one repo:
+
+```yaml
+jobs:
+  sast:
+    uses: Crypto-Voucher/.github/.github/workflows/sast.yml@v2.6
+    with:
+      runs_on: '["ubuntu-latest"]'
+    secrets: inherit
+```
+
 ## Versioning
 
 Service repos pin reusable workflows to a major tag:
