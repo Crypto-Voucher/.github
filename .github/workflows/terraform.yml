@@ -38,7 +38,7 @@ name: Terraform
 #           only. Re-plans against
 #           the merged code and applies that plan, root by root in the order
 #           given, with the apply role, inside `environment` (default
-#           `production`, which github_iac restricts to protected branches).
+#           `production`, which github_iac restricts to the default branch).
 #           Roots with "apply": false are planned on PRs and never applied.
 #   status  Always runs. The single check to require in the branch ruleset:
 #           "terraform / status" (with the wrapper job named `terraform`).
