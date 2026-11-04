@@ -287,7 +287,9 @@ jobs:
 
       - name: Init
         working-directory: ${{ matrix.root.dir }}
-        run: terraform init -lockfile=readonly
+        # Not -lockfile=readonly: most lock files only carry macOS h1 hashes,
+        # and init has to add the linux one. Versions still come from the lock.
+        run: terraform init
 
       - name: Select workspace
         if: matrix.root.workspace != 'default'
@@ -485,7 +487,9 @@ jobs:
 
       - name: Init
         working-directory: ${{ matrix.root.dir }}
-        run: terraform init -lockfile=readonly
+        # Not -lockfile=readonly: most lock files only carry macOS h1 hashes,
+        # and init has to add the linux one. Versions still come from the lock.
+        run: terraform init
 
       - name: Select workspace
         if: matrix.root.workspace != 'default'
