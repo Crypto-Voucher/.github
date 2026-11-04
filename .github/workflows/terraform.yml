@@ -1,0 +1,537 @@
+name: Terraform
+
+# Reusable Terraform pipeline for the IaC repos (github_iac, gmc_iac,
+# jit_access_iac, security_iac, old_iac). One wrapper per repo, triggered on
+# pull_request and on push to the default branch:
+#
+#   on:
+#     pull_request:
+#     push:
+#       branches: [master]
+#     workflow_dispatch:
+#
+#   permissions:
+#     id-token: write
+#     contents: read
+#     pull-requests: write
+#
+#   jobs:
+#     terraform:
+#       uses: Crypto-Voucher/.github/.github/workflows/terraform.yml@v2.7
+#       secrets: inherit
+#       with:
+#         roots: |
+#           [
+#             {"dir": "s3"},
+#             {"dir": "kms", "name": "kms-stage", "workspace": "stage", "var_files": ["stage.tfvars"]},
+#             {"dir": "hot-wallet", "apply": false}
+#           ]
+#
+# Jobs:
+#   detect  Works out which roots the change touches (files under `dir`, or
+#           under any `watch` prefix). A change to .github/workflows/, a
+#           workflow_dispatch, or a push whose base is unknown selects every
+#           root. Markdown files never trigger anything.
+#   plan    pull_request only. fmt -check, validate, plan -lock=false with the
+#           read-only plan role; one sticky comment per root on the PR.
+#   apply   push to / dispatch on the default branch only. Re-plans against
+#           the merged code and applies that plan, root by root in the order
+#           given, with the apply role, inside `environment` (default
+#           `production`, which github_iac restricts to protected branches).
+#           Roots with "apply": false are planned on PRs and never applied.
+#   status  Always runs. The single check to require in the branch ruleset:
+#           "terraform / status" (with the wrapper job named `terraform`).
+#
+# Root fields (only `dir` is required):
+#   dir             Root module directory, relative to the repo root.
+#   name            Unique id used in job names, comments and concurrency.
+#                   Defaults to `dir`; required when two entries share a dir.
+#   workspace       Terraform workspace. Default "default".
+#   var_files       List of -var-file paths, relative to `dir`.
+#   apply           false = plan only. Default true.
+#   watch           Extra path prefixes that also select this root
+#                   (e.g. "lambdas/", "modules/").
+#   build           Shell command run from the repo root before Terraform,
+#                   without AWS credentials (e.g. building Lambda bundles).
+#   ssm_vars        {"var_name": "/ssm/path"}: SecureString parameters
+#                   exported as TF_VAR_var_name. Read with the job's role.
+#   secret_env      {"ENV_NAME": "SECRET_NAME"}: repo/org secrets exported as
+#                   env vars (e.g. GITHUB_TOKEN for the github provider).
+#                   Needs `secrets: inherit` in the wrapper.
+#   plan_role_arn   Override of the plan / apply role for this root (e.g.
+#   apply_role_arn  per-root apply roles, or a root in another account).
+#   aws_region      Override of inputs.aws_region.
+#
+# Roles: plan_role_arn / apply_role_arn inputs, else the TF_PLAN_ROLE_ARN /
+# TF_APPLY_ROLE_ARN Actions variables of the calling repo. The plan role is
+# trusted for `repo:<org>/<repo>:pull_request`, the apply role for
+# `repo:<org>/<repo>:environment:production` only, so PR code never gets
+# write access. Roles live in gmc_iac/ci-terraform-roles.
+
+on:
+  workflow_call:
+    inputs:
+      roots:
+        description: JSON list of Terraform roots, see the header comment.
+        required: true
+        type: string
+      terraform_version:
+        required: false
+        type: string
+        default: '1.17.1'
+      aws_region:
+        required: false
+        type: string
+        default: eu-central-1
+      plan_role_arn:
+        description: Read-only role for PR plans. Default vars.TF_PLAN_ROLE_ARN.
+        required: false
+        type: string
+        default: ''
+      apply_role_arn:
+        description: Role for applies on the default branch. Default vars.TF_APPLY_ROLE_ARN.
+        required: false
+        type: string
+        default: ''
+      environment:
+        description: GitHub environment the apply job runs in.
+        required: false
+        type: string
+        default: production
+      node_version:
+        description: Set up Node.js for roots with a `build` command.
+        required: false
+        type: string
+        default: ''
+      runs_on:
+        description: >-
+          JSON list of runner labels. Defaults to the self-hosted CI pool
+          (gmc_iac/github-runners-v2): it has no AWS permissions of its own,
+          so a job only ever holds the OIDC role it assumed.
+        required: false
+        type: string
+        default: '["self-hosted", "linux", "x64", "ci"]'
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: '1'
+  TF_INPUT: '0'
+
+jobs:
+  detect:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    outputs:
+      plan: ${{ steps.select.outputs.plan }}
+      apply: ${{ steps.select.outputs.apply }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select roots
+        id: select
+        env:
+          ROOTS: ${{ inputs.roots }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          roots=$(jq -c '[.[] | {
+              dir: .dir,
+              name: (.name // .dir),
+              workspace: (.workspace // "default"),
+              var_files: (.var_files // []),
+              apply: (if .apply == false then false else true end),
+              watch: (.watch // []),
+              build: (.build // ""),
+              ssm_vars: (.ssm_vars // {}),
+              secret_env: (.secret_env // {}),
+              plan_role_arn: (.plan_role_arn // ""),
+              apply_role_arn: (.apply_role_arn // ""),
+              aws_region: (.aws_region // "")
+            }]' <<<"$ROOTS")
+
+          if jq -e 'any(.[]; .dir == null)' <<<"$roots" >/dev/null; then
+            echo "::error::Every root needs a dir"; exit 1
+          fi
+          dupes=$(jq -r 'group_by(.name) | map(select(length > 1) | .[0].name) | join(", ")' <<<"$roots")
+          if [ -n "$dupes" ]; then
+            echo "::error::Duplicate root names: $dupes (set \"name\" when two entries share a dir)"; exit 1
+          fi
+
+          all=false
+          case "$EVENT" in
+            pull_request)
+              changed=$(git diff --name-only "$PR_BASE" HEAD) ;;
+            push)
+              if [[ "$PUSH_BEFORE" =~ ^0+$ ]] || ! git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                all=true; changed=""
+              else
+                changed=$(git diff --name-only "$PUSH_BEFORE" HEAD)
+              fi ;;
+            *)
+              all=true; changed="" ;;
+          esac
+
+          changed=$(grep -v -E '\.md$' <<<"$changed" || true)
+          if grep -q -E '^\.github/workflows/' <<<"$changed"; then
+            all=true
+          fi
+
+          echo "Changed files:"; sed 's/^/  /' <<<"$changed"
+
+          selected=$(jq -c --argjson all "$all" --arg changed "$changed" '
+            ($changed | split("\n") | map(select(. != ""))) as $files
+            | [.[] | . as $r
+                | select($all
+                    or $r.dir == "."
+                    or any($files[]; . as $f
+                        | ([$r.dir + "/"] + $r.watch) | any(. as $p | $f | startswith($p))))]
+            ' <<<"$roots")
+
+          plan=$(jq -c '.' <<<"$selected")
+          apply=$(jq -c '[.[] | select(.apply)]' <<<"$selected")
+          echo "Selected: $(jq -r 'map(.name) | join(", ")' <<<"$selected")"
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
+          echo "apply=$apply" >> "$GITHUB_OUTPUT"
+
+  plan:
+    name: plan (${{ matrix.root.name }})
+    needs: detect
+    if: github.event_name == 'pull_request' && needs.detect.outputs.plan != '[]'
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        root: ${{ fromJSON(needs.detect.outputs.plan) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        if: matrix.root.build != '' && inputs.node_version != ''
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      # Before the AWS credentials exist: whatever the build pulls in
+      # (npm packages and their install scripts) never sees the role.
+      - name: Build
+        if: matrix.root.build != ''
+        env:
+          BUILD: ${{ matrix.root.build }}
+        run: bash -euo pipefail -c "$BUILD"
+
+      - name: Resolve role
+        id: role
+        env:
+          ROLE: ${{ matrix.root.plan_role_arn || inputs.plan_role_arn || vars.TF_PLAN_ROLE_ARN }}
+        run: |
+          if [ -z "$ROLE" ]; then
+            echo "::error::No plan role: set the TF_PLAN_ROLE_ARN variable, the plan_role_arn input or the root's plan_role_arn"
+            exit 1
+          fi
+          echo "arn=$ROLE" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ matrix.root.aws_region || inputs.aws_region }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Export variables
+        env:
+          SSM_VARS: ${{ toJSON(matrix.root.ssm_vars) }}
+          SECRET_ENV: ${{ toJSON(matrix.root.secret_env) }}
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          export_env() {
+            local name="$1" value="$2" delim line
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::add-mask::$line"
+            done <<<"$value"
+            delim="EOF_$(openssl rand -hex 8)"
+            { echo "${name}<<${delim}"; echo "$value"; echo "$delim"; } >> "$GITHUB_ENV"
+          }
+          for var in $(jq -r 'keys[]' <<<"$SSM_VARS"); do
+            path=$(jq -r --arg k "$var" '.[$k]' <<<"$SSM_VARS")
+            export_env "TF_VAR_${var}" "$(aws ssm get-parameter --with-decryption --name "$path" --query Parameter.Value --output text)"
+          done
+          for env_name in $(jq -r 'keys[]' <<<"$SECRET_ENV"); do
+            secret=$(jq -r --arg k "$env_name" '.[$k]' <<<"$SECRET_ENV")
+            value=$(jq -r --arg s "$secret" '.[$s] // ""' <<<"$ALL_SECRETS")
+            if [ -z "$value" ]; then
+              echo "::error::Secret $secret is not available (missing, or the wrapper lacks secrets: inherit)"; exit 1
+            fi
+            export_env "$env_name" "$value"
+          done
+
+      - name: Init
+        working-directory: ${{ matrix.root.dir }}
+        run: terraform init -lockfile=readonly
+
+      - name: Select workspace
+        if: matrix.root.workspace != 'default'
+        working-directory: ${{ matrix.root.dir }}
+        run: terraform workspace select "${{ matrix.root.workspace }}"
+
+      - name: Format
+        id: fmt
+        continue-on-error: true
+        working-directory: ${{ matrix.root.dir }}
+        run: terraform fmt -check -recursive -diff
+
+      - name: Validate
+        id: validate
+        continue-on-error: true
+        working-directory: ${{ matrix.root.dir }}
+        run: terraform validate -no-color
+
+      # -lock=false: a plan never writes state, and without it the plan role
+      # would need write access to the lock object / table.
+      - name: Plan
+        id: plan
+        working-directory: ${{ matrix.root.dir }}
+        env:
+          VAR_FILES: ${{ toJSON(matrix.root.var_files) }}
+        run: |
+          set +e
+          mapfile -t args < <(jq -r '.[] | "-var-file=" + .' <<<"$VAR_FILES")
+          terraform plan -no-color -lock=false -detailed-exitcode -out=tfplan "${args[@]}" > plan.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 1 ]; then
+            cat plan.log
+            cp plan.log plan.txt
+          else
+            terraform show -no-color tfplan > plan.txt
+            cat plan.txt
+            terraform show -json tfplan | jq -r '
+              [.resource_changes[]?.change.actions] as $a
+              | "add=\([$a[] | select(index("create"))] | length)
+                 change=\([$a[] | select(. == ["update"])] | length)
+                 destroy=\([$a[] | select(index("delete"))] | length)"' \
+              | tr -s ' \n' ' ' > counts.txt
+          fi
+          echo "exitcode=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          ROOT_NAME: ${{ matrix.root.name }}
+          ROOT_DIR: ${{ matrix.root.dir }}
+          WORKSPACE: ${{ matrix.root.workspace }}
+          APPLY: ${{ matrix.root.apply }}
+          FMT: ${{ steps.fmt.outcome }}
+          VALIDATE: ${{ steps.validate.outcome }}
+          PLAN_EXIT: ${{ steps.plan.outputs.exitcode }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env;
+            const dir = env.ROOT_DIR;
+            const read = (f) => { try { return fs.readFileSync(`${dir}/${f}`, 'utf8').trim(); } catch { return ''; } };
+
+            const marker = `<!-- terraform-plan:${env.ROOT_NAME} -->`;
+            const status = { '0': '✅ No changes', '2': '📝 Changes', '1': '❌ Plan failed' }[env.PLAN_EXIT] || '❌ Plan did not run (init / build failed, see the run)';
+            const ok = (o) => (o === 'success' ? '✅' : '❌');
+            const counts = read('counts.txt');
+            let plan = read('plan.txt');
+            if (plan.length > 60000) plan = plan.substring(0, 60000) + '\n... (truncated, full plan in the job log)';
+
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+              `### Terraform plan: \`${env.ROOT_NAME}\` — ${status}`,
+              '',
+              `dir \`${dir}\` · workspace \`${env.WORKSPACE}\` · fmt ${ok(env.FMT)} · validate ${ok(env.VALIDATE)}` +
+                (counts ? ` · ${counts}` : '') +
+                (env.APPLY === 'true' ? '' : ' · **plan only, not applied on merge**'),
+              '',
+              `<details${env.PLAN_EXIT === '0' ? '' : ' open'}><summary>Plan output</summary>`,
+              '',
+              '```',
+              plan,
+              '```',
+              '</details>',
+              '',
+              `[Run](${run}) · commit ${context.payload.pull_request.head.sha.substring(0, 7)}`,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find((c) => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Result
+        if: always()
+        env:
+          FMT: ${{ steps.fmt.outcome }}
+          VALIDATE: ${{ steps.validate.outcome }}
+          PLAN_EXIT: ${{ steps.plan.outputs.exitcode }}
+        run: |
+          echo "fmt=$FMT validate=$VALIDATE plan_exitcode=$PLAN_EXIT"
+          [ "$FMT" = success ] && [ "$VALIDATE" = success ] && { [ "$PLAN_EXIT" = 0 ] || [ "$PLAN_EXIT" = 2 ]; }
+
+  apply:
+    name: apply (${{ matrix.root.name }})
+    needs: detect
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref_name == github.event.repository.default_branch
+      && needs.detect.outputs.apply != '[]'
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: terraform-apply-${{ github.repository }}-${{ matrix.root.name }}
+      cancel-in-progress: false
+    strategy:
+      # Roots apply one at a time, in the order listed: later roots may read
+      # the remote state of earlier ones. A failure stops the rest.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        root: ${{ fromJSON(needs.detect.outputs.apply) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        if: matrix.root.build != '' && inputs.node_version != ''
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Build
+        if: matrix.root.build != ''
+        env:
+          BUILD: ${{ matrix.root.build }}
+        run: bash -euo pipefail -c "$BUILD"
+
+      - name: Resolve role
+        id: role
+        env:
+          ROLE: ${{ matrix.root.apply_role_arn || inputs.apply_role_arn || vars.TF_APPLY_ROLE_ARN }}
+        run: |
+          if [ -z "$ROLE" ]; then
+            echo "::error::No apply role: set the TF_APPLY_ROLE_ARN variable, the apply_role_arn input or the root's apply_role_arn"
+            exit 1
+          fi
+          echo "arn=$ROLE" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ matrix.root.aws_region || inputs.aws_region }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Export variables
+        env:
+          SSM_VARS: ${{ toJSON(matrix.root.ssm_vars) }}
+          SECRET_ENV: ${{ toJSON(matrix.root.secret_env) }}
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          export_env() {
+            local name="$1" value="$2" delim line
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::add-mask::$line"
+            done <<<"$value"
+            delim="EOF_$(openssl rand -hex 8)"
+            { echo "${name}<<${delim}"; echo "$value"; echo "$delim"; } >> "$GITHUB_ENV"
+          }
+          for var in $(jq -r 'keys[]' <<<"$SSM_VARS"); do
+            path=$(jq -r --arg k "$var" '.[$k]' <<<"$SSM_VARS")
+            export_env "TF_VAR_${var}" "$(aws ssm get-parameter --with-decryption --name "$path" --query Parameter.Value --output text)"
+          done
+          for env_name in $(jq -r 'keys[]' <<<"$SECRET_ENV"); do
+            secret=$(jq -r --arg k "$env_name" '.[$k]' <<<"$SECRET_ENV")
+            value=$(jq -r --arg s "$secret" '.[$s] // ""' <<<"$ALL_SECRETS")
+            if [ -z "$value" ]; then
+              echo "::error::Secret $secret is not available (missing, or the wrapper lacks secrets: inherit)"; exit 1
+            fi
+            export_env "$env_name" "$value"
+          done
+
+      - name: Init
+        working-directory: ${{ matrix.root.dir }}
+        run: terraform init -lockfile=readonly
+
+      - name: Select workspace
+        if: matrix.root.workspace != 'default'
+        working-directory: ${{ matrix.root.dir }}
+        run: terraform workspace select "${{ matrix.root.workspace }}"
+
+      # Planned again rather than reusing the PR plan: the PR plan was made
+      # against the PR head, master may have moved since.
+      - name: Plan
+        id: plan
+        working-directory: ${{ matrix.root.dir }}
+        env:
+          VAR_FILES: ${{ toJSON(matrix.root.var_files) }}
+        run: |
+          set +e
+          mapfile -t args < <(jq -r '.[] | "-var-file=" + .' <<<"$VAR_FILES")
+          terraform plan -no-color -lock-timeout=10m -detailed-exitcode -out=tfplan "${args[@]}"
+          rc=$?
+          set -e
+          echo "exitcode=$rc" >> "$GITHUB_OUTPUT"
+          [ "$rc" -ne 1 ]
+
+      - name: Apply
+        if: steps.plan.outputs.exitcode == '2'
+        working-directory: ${{ matrix.root.dir }}
+        run: terraform apply -no-color -lock-timeout=10m tfplan
+
+      - name: Summary
+        if: always()
+        env:
+          ROOT_NAME: ${{ matrix.root.name }}
+          PLAN_EXIT: ${{ steps.plan.outputs.exitcode }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$PLAN_EXIT" in
+            0) result="no changes" ;;
+            2) result="changes, apply: $JOB_STATUS" ;;
+            *) result="plan failed" ;;
+          esac
+          echo "- \`$ROOT_NAME\`: $result" >> "$GITHUB_STEP_SUMMARY"
+
+  status:
+    needs: [detect, plan, apply]
+    if: always()
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    steps:
+      - name: Check results
+        env:
+          DETECT: ${{ needs.detect.result }}
+          PLAN: ${{ needs.plan.result }}
+          APPLY: ${{ needs.apply.result }}
+        run: |
+          echo "detect=$DETECT plan=$PLAN apply=$APPLY"
+          [ "$DETECT" = success ] || exit 1
+          for r in "$PLAN" "$APPLY"; do
+            case "$r" in success|skipped) ;; *) exit 1 ;; esac
+          done
