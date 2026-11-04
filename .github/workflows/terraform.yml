@@ -34,7 +34,8 @@ name: Terraform
 #           root. Markdown files never trigger anything.
 #   plan    pull_request only. fmt -check, validate, plan -lock=false with the
 #           read-only plan role; one sticky comment per root on the PR.
-#   apply   push to / dispatch on the default branch only. Re-plans against
+#   apply   push to / dispatch on the default branch (or `apply_branch`)
+#           only. Re-plans against
 #           the merged code and applies that plan, root by root in the order
 #           given, with the apply role, inside `environment` (default
 #           `production`, which github_iac restricts to protected branches).
@@ -98,6 +99,13 @@ on:
         required: false
         type: string
         default: production
+      apply_branch:
+        description: >-
+          Branch whose pushes are applied. Default: the repo's default branch.
+          gmc_iac's `stage` branch sets `stage` (with environment `stage`).
+        required: false
+        type: string
+        default: ''
       node_version:
         description: Set up Node.js for roots with a `build` command.
         required: false
@@ -395,7 +403,7 @@ jobs:
     needs: detect
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-      && github.ref_name == github.event.repository.default_branch
+      && github.ref_name == (inputs.apply_branch || github.event.repository.default_branch)
       && needs.detect.outputs.apply != '[]'
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     environment: ${{ inputs.environment }}
@@ -403,7 +411,7 @@ jobs:
       id-token: write
       contents: read
     concurrency:
-      group: terraform-apply-${{ github.repository }}-${{ matrix.root.name }}
+      group: terraform-apply-${{ github.repository }}-${{ inputs.environment }}-${{ matrix.root.name }}
       cancel-in-progress: false
     strategy:
       # Roots apply one at a time, in the order listed: later roots may read
