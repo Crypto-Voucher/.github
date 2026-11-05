@@ -88,6 +88,11 @@ Tagging convention:
 - `vX` — mutable, points at the most recent `vX.Y.Z`. Service repos use
   this so they get bug fixes for free without re-pinning.
 
+`vX.Y` and `vX.Y.Z` cannot be moved or deleted (ruleset `release-tags`,
+github_iac `repositories/configs/_github.yaml`): the IaC repos run
+`terraform.yml@vX.Y` with production roles, so a release tag must keep
+pointing at the reviewed commit it was created on. A fix is a new tag.
+
 ### Releasing a patch / non-breaking change
 
 ```bash
