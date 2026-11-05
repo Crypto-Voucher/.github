@@ -36,11 +36,23 @@ invoke from their own thin wrappers:
 | `security-build.yml`   | Trivy FS + config + image scan, CycloneDX SBOM upload to Dependency-Track |
 | `deploy.yml@v1`           | Build → push to ECR+GHCR → `helm upgrade` on EKS → Telegram notify |
 | `deploy.yml@v2`        | Build → push to ECR+GHCR → image summary → Telegram; deployment is promoted manually by GitOps |
+| `terraform.yml`        | IaC repos: plan on PR (sticky comment per root), apply on merge to the default branch |
 
 Inputs and required secrets/variables for each workflow are documented in
 header comments inside the file. The corresponding service-repo wrapper
 templates live in
 [`Crypto-Voucher/github_iac`](https://github.com/Crypto-Voucher/github_iac/tree/master/templates/service-repo).
+
+### `terraform.yml`
+
+Used by the IaC repos (`github_iac`, `gmc_iac`, `jit_access_iac`,
+`security_iac`, `old_iac`). Each repo lists its Terraform roots in its
+wrapper; the workflow plans the roots a PR touches with a read-only role and
+comments the plan, and after merge re-plans and applies them with the apply
+role inside the `production` environment. Roots marked `"apply": false` are
+plan-only. The required check is `terraform / status`. Inputs, root fields and
+the role contract are documented in the header of the file; the roles
+themselves are defined in `gmc_iac/ci-terraform-roles`.
 
 ### Runners
 
@@ -75,6 +87,11 @@ Tagging convention:
   that changes a workflow.
 - `vX` — mutable, points at the most recent `vX.Y.Z`. Service repos use
   this so they get bug fixes for free without re-pinning.
+
+`vX.Y` and `vX.Y.Z` cannot be moved or deleted (ruleset `release-tags`,
+github_iac `repositories/configs/_github.yaml`): the IaC repos run
+`terraform.yml@vX.Y` with production roles, so a release tag must keep
+pointing at the reviewed commit it was created on. A fix is a new tag.
 
 ### Releasing a patch / non-breaking change
 
