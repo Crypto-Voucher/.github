@@ -220,6 +220,11 @@ jobs:
       fail-fast: false
       matrix:
         root: ${{ fromJSON(needs.detect.outputs.plan) }}
+    # The workspace is set from init on: a workspace select after init comes
+    # too late, init has already read the default workspace's state, which an
+    # apply role scoped to another workspace may not read.
+    env:
+      TF_WORKSPACE: ${{ matrix.root.workspace }}
     steps:
       - uses: actions/checkout@v4
 
@@ -290,11 +295,6 @@ jobs:
         # Not -lockfile=readonly: most lock files only carry macOS h1 hashes,
         # and init has to add the linux one. Versions still come from the lock.
         run: terraform init
-
-      - name: Select workspace
-        if: matrix.root.workspace != 'default'
-        working-directory: ${{ matrix.root.dir }}
-        run: terraform workspace select "${{ matrix.root.workspace }}"
 
       - name: Format
         id: fmt
@@ -422,6 +422,11 @@ jobs:
       fail-fast: true
       matrix:
         root: ${{ fromJSON(needs.detect.outputs.apply) }}
+    # The workspace is set from init on: a workspace select after init comes
+    # too late, init has already read the default workspace's state, which an
+    # apply role scoped to another workspace may not read.
+    env:
+      TF_WORKSPACE: ${{ matrix.root.workspace }}
     steps:
       - uses: actions/checkout@v4
 
@@ -490,11 +495,6 @@ jobs:
         # Not -lockfile=readonly: most lock files only carry macOS h1 hashes,
         # and init has to add the linux one. Versions still come from the lock.
         run: terraform init
-
-      - name: Select workspace
-        if: matrix.root.workspace != 'default'
-        working-directory: ${{ matrix.root.dir }}
-        run: terraform workspace select "${{ matrix.root.workspace }}"
 
       # Planned again rather than reusing the PR plan: the PR plan was made
       # against the PR head, master may have moved since.
