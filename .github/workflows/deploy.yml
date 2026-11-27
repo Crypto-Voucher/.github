@@ -208,7 +208,7 @@ jobs:
             TITLE="${TITLE} · PRODUCTION"; ENV_FIELD="🚨 PRODUCTION"
           fi
 
-          FIELDS="*Service:* $(esc "$SERVICE")\n\n*Environment:* $(esc "$ENV_FIELD")\n\n*Repository:* $(esc "$REPOSITORY")\n\n*Image:* \`$(esc "${IMAGE_TAG:-n/a}")\`\n\n*Triggered by:* $(esc "$ACTOR")"
+          FIELDS="*Service:* $(esc "$SERVICE")\n*Environment:* $(esc "$ENV_FIELD")\n*Repository:* $(esc "$REPOSITORY")\n*Image:* \`$(esc "${IMAGE_TAG:-n/a}")\`\n*Triggered by:* $(esc "$ACTOR")"
           FOOTER="GitHub Actions · <$(esc "$RUN_URL")|Workflow run>"
           T="$(esc "$TITLE")"
 
