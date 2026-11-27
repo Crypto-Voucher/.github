@@ -34,8 +34,8 @@ invoke from their own thin wrappers:
 | `code-quality.yml`     | Node lint + unit tests (`.nvmrc` for version, npm by default)    |
 | `sast.yml`             | Semgrep static analysis with the org's preset rule bundles       |
 | `security-build.yml`   | Trivy FS + config + image scan, CycloneDX SBOM upload to Dependency-Track |
-| `deploy.yml@v1`           | Build → push to ECR+GHCR → `helm upgrade` on EKS → Telegram notify |
-| `deploy.yml@v2`        | Build → push to ECR+GHCR → image summary → Telegram; deployment is promoted manually by GitOps |
+| `deploy.yml@v1`           | Build → push to ECR+GHCR → `helm upgrade` on EKS → Telegram notify (legacy) |
+| `deploy.yml@v2`        | Build → push to ECR+GHCR → image summary → Slack `#ci-builds` (+ Telegram until CV-3137 ends); deployment is promoted manually by GitOps |
 | `terraform.yml`        | IaC repos: plan on PR (sticky comment per root), apply on merge to the default branch |
 
 Inputs and required secrets/variables for each workflow are documented in

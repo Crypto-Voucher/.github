@@ -1,7 +1,8 @@
 name: Build and Push
 
 # Reusable build workflow for services deployed by GitOps. Builds the
-# service's Docker image, pushes it to ECR and GHCR, and notifies Telegram.
+# service's Docker image, pushes it to ECR and GHCR, and notifies Slack
+# (#ci-builds; plus Telegram until the CV-3137 migration ends).
 # Image promotion and Kubernetes deployment are handled separately through
 # the GitOps repository and Argo CD.
 #
@@ -10,10 +11,12 @@ name: Build and Push
 # behaves accordingly.
 #
 # Required org secrets (org-level or repo-level):
-#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#   SLACK_CI_BOT_TOKEN (github_iac secrets/main.tf, from SSM)
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (until the Telegram copy is removed)
 #
 # Required org variables:
 #   AWS_DEPLOY_ROLE_ARN — OIDC role with ECR push + EKS access.
+#   SLACK_CI_CHANNEL_ID — Slack channel for build results (#ci-builds).
 
 on:
   workflow_call:
@@ -28,7 +31,7 @@ on:
         required: true
         type: string
       service_name:
-        description: Service name used in the image summary and Telegram message.
+        description: Service name used in the image summary and the Slack / Telegram message.
         required: true
         type: string
       ecr_repository:
@@ -169,6 +172,51 @@ jobs:
           echo "- Environment: ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Tag: \`${{ steps.image.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- ECR: \`${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.image.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # Never fails the build: a missing secret or a Slack error is a warning.
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_TOKEN: ${{ secrets.SLACK_CI_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ vars.SLACK_CI_CHANNEL_ID }}
+          JOB_STATUS: ${{ job.status }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service_name }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ -z "$SLACK_TOKEN" || -z "$SLACK_CHANNEL" ]]; then
+            echo "::warning::SLACK_CI_BOT_TOKEN or SLACK_CI_CHANNEL_ID not set, skipping Slack notification"
+            exit 0
+          fi
+
+          STATUS="✅ Image build successful"
+          if [[ "$JOB_STATUS" != "success" ]]; then
+            STATUS="❌ Image build failed"
+          fi
+
+          ENV_LABEL="🌍 ${ENVIRONMENT}"
+          if [[ "$ENVIRONMENT" == "prod" ]]; then
+            ENV_LABEL="🚨 *PRODUCTION* 🚨"
+          fi
+
+          TEXT="${ENV_LABEL} | *${STATUS}*
+          *Service:* ${SERVICE}
+          *Repo:* ${REPOSITORY}
+          *Image:* \`${IMAGE_TAG:-n/a}\`
+          *Triggered by:* ${ACTOR}
+          <${RUN_URL}|Workflow run>"
+          TEXT="$(printf '%s' "$TEXT" | sed 's/^ *//')"
+
+          RESPONSE="$(curl -s -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_TOKEN}" \
+            --data-urlencode "channel=${SLACK_CHANNEL}" \
+            --data-urlencode "text=${TEXT}" || true)"
+          if [[ "$RESPONSE" != *'"ok":true'* ]]; then
+            echo "::warning::Slack notification failed: $(printf '%s' "$RESPONSE" | grep -o '"error":"[^"]*"' || echo "no response")"
+          fi
 
       - name: Notify Telegram
         if: always()
