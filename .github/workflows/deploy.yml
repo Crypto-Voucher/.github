@@ -174,6 +174,9 @@ jobs:
           echo "- ECR: \`${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.image.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
 
       # Never fails the build: a missing secret or a Slack error is a warning.
+      # Same layout as the CV API team notifications: sender + emoji avatar,
+      # header with a status circle, coloured side bar, one field per row,
+      # divider and footer. Needs the chat:write.customize bot scope.
       - name: Notify Slack
         if: always()
         env:
@@ -192,28 +195,34 @@ jobs:
             exit 0
           fi
 
-          STATUS="✅ Image build successful"
-          if [[ "$JOB_STATUS" != "success" ]]; then
-            STATUS="❌ Image build failed"
-          fi
+          # JSON string escaping without jq (not guaranteed on the runners).
+          esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
-          ENV_LABEL="🌍 ${ENVIRONMENT}"
+          if [[ "$JOB_STATUS" == "success" ]]; then
+            TITLE="🟢 Image build successful"; COLOR="#12b76a"
+          else
+            TITLE="🔴 Image build failed"; COLOR="#d92d20"
+          fi
+          ENV_FIELD="$ENVIRONMENT"
           if [[ "$ENVIRONMENT" == "prod" ]]; then
-            ENV_LABEL="🚨 *PRODUCTION* 🚨"
+            TITLE="${TITLE} · PRODUCTION"; ENV_FIELD="🚨 PRODUCTION"
           fi
 
-          TEXT="${ENV_LABEL} | *${STATUS}*
-          *Service:* ${SERVICE}
-          *Repo:* ${REPOSITORY}
-          *Image:* \`${IMAGE_TAG:-n/a}\`
-          *Triggered by:* ${ACTOR}
-          <${RUN_URL}|Workflow run>"
-          TEXT="$(printf '%s' "$TEXT" | sed 's/^ *//')"
+          FIELDS="*Service:* $(esc "$SERVICE")\n\n*Environment:* $(esc "$ENV_FIELD")\n\n*Repository:* $(esc "$REPOSITORY")\n\n*Image:* \`$(esc "${IMAGE_TAG:-n/a}")\`\n\n*Triggered by:* $(esc "$ACTOR")"
+          FOOTER="GitHub Actions · <$(esc "$RUN_URL")|Workflow run>"
+          T="$(esc "$TITLE")"
+
+          BLOCKS="[{\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\"$T\",\"emoji\":true}}]"
+          ATTACHMENTS="[{\"color\":\"$COLOR\",\"blocks\":[{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"$FIELDS\"}},{\"type\":\"divider\"},{\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":\"$FOOTER\"}]}]}]"
 
           RESPONSE="$(curl -s -X POST https://slack.com/api/chat.postMessage \
             -H "Authorization: Bearer ${SLACK_TOKEN}" \
             --data-urlencode "channel=${SLACK_CHANNEL}" \
-            --data-urlencode "text=${TEXT}" || true)"
+            --data-urlencode "text=${TITLE}" \
+            --data-urlencode "username=CV · CI" \
+            --data-urlencode "icon_emoji=:building_construction:" \
+            --data-urlencode "blocks=${BLOCKS}" \
+            --data-urlencode "attachments=${ATTACHMENTS}" || true)"
           if [[ "$RESPONSE" != *'"ok":true'* ]]; then
             echo "::warning::Slack notification failed: $(printf '%s' "$RESPONSE" | grep -o '"error":"[^"]*"' || echo "no response")"
           fi
